@@ -45,24 +45,65 @@ function identify_reviewers_by_changed_files({ config, changed_files, excludes =
 
   if (!config.files) {
     core.info('A "files" key does not exist in config; returning no reviewers for changed files.');
+    // TODO: don't forget to update with new response payload
     return [];
   }
 
-  const matching_reviewers = [];
+  // reviewers without review decision considerations
+  const reviewers = {
+    matched: [], // reviewers matched for all changes in the PR
+    must_be_added: [], // reviewers matched for added or removed files in the last commit
+    should_be_added: [], // reviewers matched for changed files in the last commit
+    could_be_removed: [], // reviewers matched for files reverted in the last commit (not part of the PR anymore)
+  };
 
+  // TODO: add handling for the old behaviour
   Object.entries(config.files).forEach(([ glob_pattern, reviewers ]) => {
-    if (changed_files.some((changed_file) => minimatch(changed_file, glob_pattern))) {
+    const has_matches = (changed_file) => minimatch(changed_file, glob_pattern);
+    const last_changed_files = [].concat(
+      changed_files.last.added,
+      changed_files.last.removed,
+      changed_files.last.modified
+    );
+
+    if (last_changed_files.some(has_matches)) {
       if (last_files_match_only) {
-        matching_reviewers.length = 0; // clear previous matches
+        reviewers.matched.length = 0; // clear previous matches
       }
-      matching_reviewers.push(...reviewers);
+      reviewers.matched.push(...reviewers);
+    }
+
+    if (changed_files.last.modified.some(has_matches)) {
+      reviewers.should_be_added.push(...reviewers);
+    }
+
+    const added_or_deleted = [].concat(
+      changed_files.last.added,
+      changed_files.last.removed
+    );
+
+    if (added_or_deleted.some(has_matches)) {
+      reviewers.must_be_added.push(...reviewers);
+    }
+
+    const all_changed_files = [].concat(
+      changed_files.total.added,
+      changed_files.total.removed,
+      changed_files.total.modified
+    );
+    const reverted_files = last_changed_files.filter((changed_file) => !all_changed_files.includes(changed_file));
+
+    if (reverted_files.some(has_matches)) {
+      reviewers.could_be_removed.push(...reviewers);
     }
   });
 
-  const individuals = replace_groups_with_individuals({ reviewers: matching_reviewers, config });
+  const processed_reviewers = Object.entries(reviewers).reduce((result, [ key, value ]) => {
+    result[key] = replace_groups_with_individuals({ reviewers: value, config, excludes });
+    return result;
+  }, {});
 
-  // Depue and filter the results
-  return [ ...new Set(individuals) ].filter((reviewer) => !excludes.includes(reviewer));
+  return processed_reviewers;
 }
 
 function identify_reviewers_by_author({ config, 'author': specified_author }) {
@@ -137,11 +178,14 @@ function randomly_pick_reviewers({ reviewers, config }) {
 
 /* Private */
 
-function replace_groups_with_individuals({ reviewers, config }) {
+function replace_groups_with_individuals({ reviewers, config, excludes = [] }) {
   const groups = (config.reviewers && config.reviewers.groups) || {};
-  return reviewers.flatMap((reviewer) =>
+  const individuals = reviewers.flatMap((reviewer) =>
     Array.isArray(groups[reviewer]) ? groups[reviewer] : reviewer
   );
+  const deduplicated_individuals = Array.from(new Set(individuals));
+
+  return deduplicated_individuals.filter((individual) => !excludes.includes(individual));
 }
 
 module.exports = {

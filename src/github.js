@@ -5,26 +5,26 @@ const fs = require('fs');
 const github = require('@actions/github');
 const partition = require('lodash/partition');
 const yaml = require('yaml');
-const { LOCAL_FILE_MISSING } = require('./constants');
+const { LOCAL_FILE_MISSING, GITHUB_TEAM_PREFIX } = require('./constants');
 
 class PullRequest {
   // ref: https://developer.github.com/v3/pulls/#get-a-pull-request
-  constructor(pull_request_paylaod) {
+  constructor(pull_request_payload) {
     // "ncc" doesn't yet support private class fields as of 29 Aug. 2020
     // ref: https://github.com/vercel/ncc/issues/499
-    this._pull_request_paylaod = pull_request_paylaod;
+    this._pull_request_payload = pull_request_payload;
   }
 
   get author() {
-    return this._pull_request_paylaod.user.login;
+    return this._pull_request_payload.user.login;
   }
 
   get title() {
-    return this._pull_request_paylaod.title;
+    return this._pull_request_payload.title;
   }
 
   get is_draft() {
-    return this._pull_request_paylaod.draft;
+    return this._pull_request_payload.draft;
   }
 }
 
@@ -71,37 +71,110 @@ async function fetch_changed_files() {
   const context = get_context();
   const octokit = get_octokit();
 
-  const changed_files = [];
+  const file_changes = {
+    total: {
+      added: [],
+      removed: [],
+      modified: [],
+    },
+    last: {
+      added: [],
+      removed: [],
+      modified: [],
+    },
+  };
 
-  const per_page = 100;
-  let page = 0;
-  let number_of_files_in_current_page;
+  const repo_info = {
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+  };
 
-  do {
-    page += 1;
+  const pull_request_info = {
+    ...repo_info,
+    pull_number: context.payload.pull_request.number,
+  };
 
-    const { data: response_body } = await octokit.pulls.listFiles({
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      pull_number: context.payload.pull_request.number,
-      page,
-      per_page,
+  for await (const { data: files } of octokit.paginate.iterator(octokit.pulls.listFiles, pull_request_info)) {
+    files.forEach(({ filename, status }) => {
+      file_changes.total[status].push(filename);
+    });
+  }
+
+  const { data: commits } = await octokit.pulls.listCommits({
+    ...pull_request_info,
+    page: -1,
+  });
+
+  if (commits.length > 1) {
+    const [ prev, last ] = commits.slice(-2);
+    const { data: { files } } = await octokit.repos.compareCommits({
+      ...repo_info,
+      base: prev.sha,
+      head: last.sha,
     });
 
-    number_of_files_in_current_page = response_body.length;
-    changed_files.push(...response_body.map((file) => file.filename));
+    files.forEach(({ filename, status }) => {
+      file_changes.last[status].push(filename);
+    });
+  } else {
+    file_changes.last = file_changes.total;
+  }
 
-  } while (number_of_files_in_current_page === per_page);
+  return file_changes;
+}
 
-  return changed_files;
+async function fetch_review_info() {
+  const context = get_context();
+  const octokit = get_octokit();
+
+  const review_info = {
+    pending: [],
+    approved: [],
+    commented: [],
+    changes_requested: [],
+  };
+
+  const pull_request_info = {
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    pull_number: context.payload.pull_request.number,
+  };
+
+  for await (const { data: reviews } of octokit.paginate.iterator(octokit.pulls.listReviews, pull_request_info)) {
+    reviews.forEach(({ user, state }) => {
+      if (state === 'COMMENTED') {
+        return review_info.commented.push(user.login);
+      }
+
+      if (state === 'APPROVED') {
+        return review_info.approved.push(user.login);
+      }
+
+      if (state === 'CHANGES_REQUESTED') {
+        return review_info.changes_requested.push(user.login);
+      }
+    });
+  }
+
+  for await (const { data: { users, teams } } of octokit.paginate.iterator(octokit.pulls.listRequestedReviewers, pull_request_info)) {
+    users.forEach(({ login }) => {
+      review_info.pending.push(login);
+    });
+
+    teams.forEach(({ name }) => {
+      review_info.pending.push(team_slug_to_team_with_prefix(name));
+    });
+  }
+
+  return review_info;
 }
 
 async function assign_reviewers(reviewers) {
   const context = get_context();
   const octokit = get_octokit();
 
-  const [ teams_with_prefix, individuals ] = partition(reviewers, (reviewer) => reviewer.startsWith('team:'));
-  const teams = teams_with_prefix.map((team_with_prefix) => team_with_prefix.replace('team:', ''));
+  const [ teams_with_prefix, individuals ] = partition(reviewers, has_team_prefix);
+  const teams = teams_with_prefix.map(team_with_prefix_to_team_slug);
 
   return octokit.pulls.requestReviewers({
     owner: context.repo.owner,
@@ -110,6 +183,53 @@ async function assign_reviewers(reviewers) {
     reviewers: individuals,
     team_reviewers: teams,
   });
+}
+
+async function filter_out_reviewers_by_individuals(individuals_and_teams, individuals_to_exclude) {
+  const context = get_context();
+  const octokit = get_octokit();
+
+  const results = [];
+
+  for (const individual_or_team of individuals_and_teams) {
+    if (has_team_prefix(individual_or_team)) {
+      continue;
+    }
+
+    const individual = individual_or_team;
+
+    if (!individuals_to_exclude.includes(individual)) {
+      results.push(individual);
+    }
+  }
+
+  for (const individual_or_team of individuals_and_teams) {
+    if (!has_team_prefix(individual_or_team)) {
+      continue;
+    }
+
+    const team = individual_or_team;
+    const members_in_org_info = {
+      org: context.repo.owner,
+      team_slug: team_with_prefix_to_team_slug(team),
+      role: 'all',
+    };
+
+    let has_excluded_individuals = false;
+
+    for await (const { data: members } of octokit.paginate.iterator(octokit.teams.listMembersInOrg, members_in_org_info)) {
+      if (members.some(({ login }) => individuals_to_exclude.includes(login))) {
+        has_excluded_individuals = true;
+        break;
+      }
+    }
+
+    if (!has_excluded_individuals) {
+      results.push(team);
+    }
+  }
+
+  return results;
 }
 
 /* Private */
@@ -152,10 +272,24 @@ function clear_cache() {
   octokit_cache = undefined;
 }
 
+function has_team_prefix(individual_or_team) {
+  return individual_or_team.startsWith(GITHUB_TEAM_PREFIX);
+}
+
+function team_with_prefix_to_team_slug(team_with_prefix) {
+  return team_with_prefix.replace(GITHUB_TEAM_PREFIX, '');
+}
+
+function team_slug_to_team_with_prefix(team_slug) {
+  return [ GITHUB_TEAM_PREFIX, team_slug ].join('');
+}
+
 module.exports = {
   get_pull_request,
   fetch_config,
   fetch_changed_files,
   assign_reviewers,
   clear_cache,
+  fetch_review_info,
+  filter_out_reviewers_by_individuals,
 };

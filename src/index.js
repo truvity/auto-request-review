@@ -44,6 +44,9 @@ async function run() {
   core.info('Fetching changed files in the pull request');
   const changed_files = await github.fetch_changed_files();
 
+  core.info('Fetching existing reviews in the pull request');
+  const review_info = await github.fetch_review_info();
+
   core.info('Identifying reviewers based on the changed files');
   const reviewers_based_on_files = identify_reviewers_by_changed_files({ config, changed_files, excludes: [ author ] });
 
@@ -52,6 +55,8 @@ async function run() {
 
   core.info('Adding other group members to reviewers if group assignment feature is on');
   const reviewers_from_same_teams = fetch_other_group_members({ config, author });
+
+  const pending_matched = await github.filter_out_reviewers_by_individuals(reviewers_based_on_files.matched, [].concat(review_info.approved, review_info.changes_requested));
 
   let reviewers = [ ...new Set([ ...reviewers_based_on_files, ...reviewers_based_on_author, ...reviewers_from_same_teams ]) ];
 
